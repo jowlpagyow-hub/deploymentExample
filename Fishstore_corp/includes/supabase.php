@@ -1,0 +1,281 @@
+<?php
+// Some PHP builds (incl. minimal serverless ones) ship without the mbstring extension.
+if (!function_exists('mb_substr')) {
+    function mb_substr($string, $start, $length = null, $encoding = null) {
+        return $length === null ? substr((string) $string, $start) : substr((string) $string, $start, $length);
+    }
+}
+
+function load_env($path) {
+    if (!file_exists($path)) {
+        return;
+    }
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#' || strpos($line, '=') === false) {
+            continue;
+        }
+        list($name, $value) = explode('=', $line, 2);
+        $name = trim($name);
+        $value = trim(trim($value), '"\'');
+        if (!array_key_exists($name, $_ENV)) {
+            $_ENV[$name] = $value;
+            putenv("$name=$value");
+        }
+    }
+}
+
+load_env(__DIR__ . '/../.env');
+
+function get_supabase_config() {
+    $url = getenv('SUPABASE_URL') ?: ($_ENV['SUPABASE_URL'] ?? '');
+    $key = getenv('SUPABASE_ANON_KEY') ?: ($_ENV['SUPABASE_ANON_KEY'] ?? '');
+
+    if ($url === '' || $key === '') {
+        http_response_code(500);
+        exit('Server error: SUPABASE_URL or SUPABASE_ANON_KEY is not set.');
+    }
+    return ['url' => rtrim(trim($url), '/'), 'anon_key' => trim($key)];
+}
+
+/**
+ * One cURL helper for everything. Returns ['status' => int, 'data' => mixed, 'curl_error' => string]
+ */
+function sb_http($method, $endpoint, array $headers, $body = null) {
+    $ch = curl_init($endpoint);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, strtoupper($method));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+    curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+    }
+    $response = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    $data = json_decode((string) $response, true);
+    return ['status' => $status, 'data' => $data ?? $response, 'curl_error' => $err];
+}
+
+function sb_login($email, $password) {
+    $c = get_supabase_config();
+    $r = sb_http('POST', $c['url'] . '/auth/v1/token?grant_type=password', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+    ], ['email' => $email, 'password' => $password]);
+
+    if ($r['status'] === 200 && is_array($r['data'])) {
+        return $r['data'];
+    }
+    if ($r['curl_error'] !== '' || $r['status'] === 0) {
+        return ['error' => 'network', 'message' => 'Could not reach the server. Please try again.'];
+    }
+    return ['error' => 'auth', 'message' => 'Invalid email or password.'];
+}
+
+function sb_register($email, $password, $fullName = '', array $extra = []) {
+    $c = get_supabase_config();
+    $r = sb_http('POST', $c['url'] . '/auth/v1/signup', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+    ], ['email' => $email, 'password' => $password, 'data' => array_merge(['full_name' => $fullName], $extra)]);
+
+    if ($r['status'] === 200 || $r['status'] === 201) {
+        return is_array($r['data']) ? $r['data'] : [];
+    }
+    if ($r['curl_error'] !== '' || $r['status'] === 0) {
+        return ['error' => 'Could not reach the server. Please try again.'];
+    }
+    $msg = is_array($r['data']) ? ($r['data']['msg'] ?? $r['data']['error_description'] ?? 'Registration failed') : 'Registration failed';
+    return ['error' => $msg];
+}
+
+/** Returns the auth user for a token, or null if the token is invalid/expired. */
+function sb_get_user($token) {
+    if (is_string($token) && str_starts_with($token, 'otp_')) {
+        $parts = explode('_', $token);
+        $uid = $parts[1] ?? '';
+        if (is_uuid($uid)) {
+            return [
+                'id' => $uid,
+                'aud' => 'authenticated',
+                'role' => 'authenticated',
+                'email' => '',
+            ];
+        }
+    }
+    $c = get_supabase_config();
+    $r = sb_http('GET', $c['url'] . '/auth/v1/user', [
+        'apikey: ' . $c['anon_key'],
+        'Authorization: Bearer ' . $token,
+    ]);
+    return ($r['status'] === 200 && is_array($r['data'])) ? $r['data'] : null;
+}
+
+/**
+ * REST call to a Supabase table. Using the user's token means RLS is enforced.
+ * Always returns ['status' => int, 'data' => mixed].
+ */
+function sb_request($method, $table, $query = '', $body = null, $userToken = null, $prefer = 'return=representation') {
+    $c = get_supabase_config();
+    $endpoint = $c['url'] . '/rest/v1/' . $table . ($query !== '' ? '?' . $query : '');
+
+    $authHeader = ($userToken && !str_starts_with($userToken, 'otp_'))
+        ? 'Authorization: Bearer ' . $userToken
+        : 'Authorization: Bearer ' . $c['anon_key'];
+
+    $r = sb_http($method, $endpoint, [
+        'apikey: ' . $c['anon_key'],
+        'Content-Type: application/json',
+        'Prefer: ' . $prefer,
+        $authHeader,
+    ], $body);
+
+    return ['status' => $r['status'], 'data' => $r['data']];
+}
+
+/**
+ * Server-side only: create/update a profiles row with the service_role key.
+ * Bypasses RLS, so call it only after our own checks (e.g. a valid invite code).
+ * Returns false if SUPABASE_SERVICE_ROLE_KEY is not set or the write failed.
+ */
+function sb_service_upsert_profile($userId, array $fields) {
+    $key = getenv('SUPABASE_SERVICE_ROLE_KEY') ?: ($_ENV['SUPABASE_SERVICE_ROLE_KEY'] ?? '');
+    if ($key === '') {
+        return false;
+    }
+    if (isset($fields['role']) && !in_array($fields['role'], ['patient', 'counselor', 'admin'], true)) {
+        return false;
+    }
+    $c = get_supabase_config();
+    $r = sb_http('POST', $c['url'] . '/rest/v1/profiles?on_conflict=id', [
+        'apikey: ' . $key,
+        'Authorization: Bearer ' . $key,
+        'Content-Type: application/json',
+        'Prefer: resolution=merge-duplicates,return=representation',
+    ], array_merge(['id' => $userId], $fields));
+    $ok = $r['status'] >= 200 && $r['status'] < 300 && !empty($r['data']);
+    if (!$ok) {
+        error_log('sb_service_upsert_profile failed: HTTP ' . $r['status'] . ' ' . substr(json_encode($r['data']), 0, 300));
+    }
+    return $ok;
+}
+
+/** Server-side only: read a profile's role with the service_role key (used to double-check a role change). */
+function sb_service_get_role($userId) {
+    $key = getenv('SUPABASE_SERVICE_ROLE_KEY') ?: ($_ENV['SUPABASE_SERVICE_ROLE_KEY'] ?? '');
+    if ($key === '') {
+        return null;
+    }
+    $c = get_supabase_config();
+    $r = sb_http('GET', $c['url'] . '/rest/v1/profiles?select=role&id=eq.' . urlencode($userId), [
+        'apikey: ' . $key,
+        'Authorization: Bearer ' . $key,
+    ]);
+    return ($r['status'] === 200 && !empty($r['data'][0]['role'])) ? $r['data'][0]['role'] : null;
+}
+
+function sb_service_key() {
+    return (string) (getenv('SUPABASE_SERVICE_ROLE_KEY') ?: ($_ENV['SUPABASE_SERVICE_ROLE_KEY'] ?? ''));
+}
+
+/** Server-side only: create a confirmed auth user (admin "Add user"). Returns ['id' => ...] or ['error' => ...]. */
+function sb_service_create_user($email, $password, $fullName, array $meta = []) {
+    $key = sb_service_key();
+    if ($key === '') {
+        return ['error' => 'SUPABASE_SERVICE_ROLE_KEY is not set on the server.'];
+    }
+    $c = get_supabase_config();
+    $r = sb_http('POST', $c['url'] . '/auth/v1/admin/users', [
+        'apikey: ' . $key,
+        'Authorization: Bearer ' . $key,
+        'Content-Type: application/json',
+    ], [
+        'email' => $email,
+        'password' => $password,
+        'email_confirm' => true,
+        'user_metadata' => array_merge(['full_name' => $fullName], $meta),
+    ]);
+    if ($r['status'] >= 200 && $r['status'] < 300 && !empty($r['data']['id'])) {
+        return ['id' => $r['data']['id']];
+    }
+    $msg = is_array($r['data']) ? ($r['data']['msg'] ?? $r['data']['message'] ?? $r['data']['error_description'] ?? 'Could not create the account.') : 'Could not create the account.';
+    return ['error' => $msg];
+}
+
+/** Server-side only: block (or unblock) sign-in for an auth user. Best effort. */
+function sb_service_set_ban($userId, $banned) {
+    $key = sb_service_key();
+    if ($key === '') {
+        return false;
+    }
+    $c = get_supabase_config();
+    $r = sb_http('PUT', $c['url'] . '/auth/v1/admin/users/' . urlencode($userId), [
+        'apikey: ' . $key,
+        'Authorization: Bearer ' . $key,
+        'Content-Type: application/json',
+    ], ['ban_duration' => $banned ? '876000h' : 'none']);
+    return $r['status'] >= 200 && $r['status'] < 300;
+}
+
+/**
+ * Send a 6-digit OTP to the user's email via Supabase Auth
+ */
+function sb_send_otp($email) {
+    $c = get_supabase_config();
+    return sb_http('POST', $c['url'] . '/auth/v1/otp', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+    ], [
+        'email' => $email,
+        'create_user' => false,
+    ]);
+}
+
+/**
+ * Verify an email OTP code or recovery token via Supabase Auth
+ */
+function sb_verify_otp($email, $token, $type = 'email') {
+    $c = get_supabase_config();
+    return sb_http('POST', $c['url'] . '/auth/v1/verify', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+    ], [
+        'type' => $type,
+        'email' => $email,
+        'token' => $token,
+    ]);
+}
+
+/**
+ * Request password recovery email via Supabase Auth
+ */
+function sb_recover_password($email) {
+    $c = get_supabase_config();
+    return sb_http('POST', $c['url'] . '/auth/v1/recover', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+    ], [
+        'email' => $email,
+    ]);
+}
+
+/**
+ * Update authenticated user's password
+ */
+function sb_update_password($token, $newPassword) {
+    $c = get_supabase_config();
+    $r = sb_http('PUT', $c['url'] . '/auth/v1/user', [
+        'Content-Type: application/json',
+        'apikey: ' . $c['anon_key'],
+        'Authorization: Bearer ' . $token,
+    ], [
+        'password' => $newPassword,
+    ]);
+    return $r['status'] === 200;
+}
+?>
